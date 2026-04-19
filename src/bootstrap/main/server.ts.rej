@@ -1,0 +1,15 @@
+--- server.ts
++++ server.ts
+@@ -1,9 +1,9 @@
+ import express, { Application } from 'express';
+ import pinoHttp from 'pino-http';
+ import pino from 'pino';
+-import { config } from '../config/env';
+-import { SecurityMiddleware, configureSecurityHeaders } from '../middleware/security';
+-import { rateLimiter } from '../middleware/rateLimiter';
++import { config } from '../../config/env';
++import { SecurityMiddleware, configureSecurityHeaders } from '../../middleware/security/securityMiddleware';
++import { rateLimiter } from '../../middleware/rate_limiter';
+ import shortenerRoutes from '../../routes/shortener';
+ import { ShutdownManager } from '../lifecycle/shutdown';
+ import { Pool } from 'pg';
