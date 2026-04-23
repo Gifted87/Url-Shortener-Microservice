@@ -67,9 +67,6 @@ describe('ShutdownManager', () => {
         // Mock successful server close
         (server.close as jest.Mock).mockImplementation((cb: Function) => cb());
         
-        // Mock successful analytics flush
-        (analyticsService.processBufferedClicks as jest.Mock).mockResolvedValue(true);
-        
         // Mock DB and Redis close
         (pgPool.end as jest.Mock).mockResolvedValue(true);
         (redis as any).quit.mockResolvedValue('OK');
@@ -77,29 +74,8 @@ describe('ShutdownManager', () => {
         await sigtermHandler();
 
         expect(server.close).toHaveBeenCalled();
-        expect(analyticsService.processBufferedClicks).toHaveBeenCalledWith(500);
         expect(pgPool.end).toHaveBeenCalled();
         expect((redis as any).quit).toHaveBeenCalled();
-        expect(process.exit).toHaveBeenCalledWith(0);
-    });
-
-    it('should retry analytics flush if first fails', async () => {
-        const manager = new ShutdownManager(server, pgPool);
-        
-        // Mock successful server close
-        (server.close as jest.Mock).mockImplementation((cb: Function) => cb());
-        
-        // Mock analytics flush fail then succeed
-        (analyticsService.processBufferedClicks as jest.Mock)
-            .mockRejectedValueOnce(new Error('Flush error'))
-            .mockResolvedValueOnce(true);
-        
-        (pgPool.end as jest.Mock).mockResolvedValue(true);
-        (redis as any).quit.mockResolvedValue('OK');
-
-        await (manager as any).handleSignal('SIGTERM');
-
-        expect(analyticsService.processBufferedClicks).toHaveBeenCalledTimes(2);
         expect(process.exit).toHaveBeenCalledWith(0);
     });
 
@@ -112,25 +88,6 @@ describe('ShutdownManager', () => {
         await (manager as any).handleSignal('SIGTERM');
 
         expect(process.exit).toHaveBeenCalledWith(1);
-    });
-
-    it('should continue if analytics flush fails twice', async () => {
-        const manager = new ShutdownManager(server, pgPool);
-        
-        (server.close as jest.Mock).mockImplementation((cb: Function) => cb());
-        
-        (analyticsService.processBufferedClicks as jest.Mock)
-            .mockRejectedValue(new Error('Flush error'));
-        
-        (pgPool.end as jest.Mock).mockResolvedValue(true);
-        (redis as any).quit.mockResolvedValue('OK');
-
-        await (manager as any).handleSignal('SIGTERM');
-
-        expect(analyticsService.processBufferedClicks).toHaveBeenCalledTimes(2);
-        expect(pgPool.end).toHaveBeenCalled();
-        expect((redis as any).quit).toHaveBeenCalled();
-        expect(process.exit).toHaveBeenCalledWith(0);
     });
 
     it('should handle timeout during server close', async () => {

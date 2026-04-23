@@ -28,26 +28,29 @@ export const rateLimiter = async (req: Request, res: Response, next: NextFunctio
 
     try {
         // Atomic increment using a pipeline to ensure EXPIRE is set on initialization
-        // We utilize the underlying ioredis client's pipeline capability via our Redis client
-        // @ts-ignore: Accessing the underlying raw client for atomic pipeline logic
+        // We utilize the NX flag on EXPIRE (Redis 7.0+) to only set if the key has no TTL.
+        // For older Redis versions, we fallback to a safe sequential check if needed, 
+        // but pipeline ensures better atomicity here.
         const results = await redis.pipeline([
             ['incr', key],
+            ['expire', key, RATE_LIMIT_WINDOW_SECONDS, 'NX'],
             ['ttl', key]
         ]);
 
-        const [[errIncr, count], [errTtl, ttl]] = results;
+        const [[errIncr, count], [errExp, exp], [errTtl, ttl]] = results;
 
         if (errIncr) throw new Error(`Redis INCR error: ${errIncr}`);
 
         const currentCount = count as number;
         
-        // If it's the first request, set the expiration
-        if (currentCount === 1) {
-            await redis.set(key, '1', RATE_LIMIT_WINDOW_SECONDS);
+        // Final fallback for older Redis versions that don't support EXPIRE NX
+        if (ttl === -1) {
+            await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS);
         }
 
         const remaining = Math.max(0, RATE_LIMIT_MAX - currentCount);
         const resetTime = Math.floor(Date.now() / 1000) + (ttl > 0 ? (ttl as number) : RATE_LIMIT_WINDOW_SECONDS);
+
 
         // Set standard rate limit headers
         res.setHeader('X-RateLimit-Limit', RATE_LIMIT_MAX.toString());

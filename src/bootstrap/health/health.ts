@@ -11,10 +11,10 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
  */
 export class HealthController {
     private readonly pgPool: Pool;
-    private readonly redisClient: Redis;
+    private readonly redisClient: any;
     private readonly dbTimeoutMs: number = 2000;
 
-    constructor(pgPool: Pool, redisClient: Redis) {
+    constructor(pgPool: Pool, redisClient: any) {
         this.pgPool = pgPool;
         this.redisClient = redisClient;
     }
@@ -62,12 +62,13 @@ export class HealthController {
 
     private async checkDatabase(): Promise<boolean> {
         let client;
+        let timer: NodeJS.Timeout | undefined;
         try {
             client = await this.pgPool.connect();
-            // Race condition: Timeout the query if it takes too long
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('DB_TIMEOUT')), this.dbTimeoutMs)
-            );
+            
+            const timeoutPromise = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error('DB_TIMEOUT')), this.dbTimeoutMs);
+            });
             
             await Promise.race([
                 client.query('SELECT 1'),
@@ -78,6 +79,7 @@ export class HealthController {
             logger.error({ err }, 'Database readiness check failed');
             return false;
         } finally {
+            if (timer) clearTimeout(timer);
             if (client) client.release();
         }
     }
@@ -95,7 +97,7 @@ export class HealthController {
     /**
      * Factory method to generate the Router instance for the health endpoints.
      */
-    public static createRouter(pgPool: Pool, redisClient: Redis): Router {
+    public static createRouter(pgPool: Pool, redisClient: any): Router {
         const router = Router();
         const controller = new HealthController(pgPool, redisClient);
 

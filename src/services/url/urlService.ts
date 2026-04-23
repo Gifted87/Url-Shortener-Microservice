@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { pool as sharedPool } from '../../database/postgres/pool';
 import { redis } from '../../database/redis/redisClient';
 import { generateAlias } from '../../utils/hashing/aliasGenerator';
 import pino from 'pino';
@@ -30,34 +31,43 @@ class UrlService {
 
   /**
    * Shortens a long URL by persisting to PostgreSQL and caching in Redis.
+   * Utilizes a collision-free strategy by generating the ID from a sequence first.
    */
   async shortenUrl(originalUrl: string, ownerId?: string): Promise<string> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
 
-      // Insert record and get the BIGSERIAL ID
+      // 1. Fetch the next ID from the sequence to guarantee uniqueness without placeholders
+      const seqRes = await client.query("SELECT nextval('urls_id_seq') as id");
+      const id = BigInt(seqRes.rows[0].id);
+
+      // 2. Generate actual alias from the reserved ID
+      const alias = generateAlias(id);
+
+      // 3. Perform a single INSERT with the final ID and Alias
       const insertQuery = `
-        INSERT INTO urls (alias, original_url, owner_id)
-        VALUES ($1, $2, $3)
-        RETURNING id, alias;
+        INSERT INTO urls (id, alias, original_url, owner_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING alias;
       `;
       
-      // Temporary alias to allow ID generation; alias updated post-insertion
-      const tempAlias = 'temp'; 
-      const res = await client.query(insertQuery, [tempAlias, originalUrl, ownerId]);
-      const id = BigInt(res.rows[0].id);
-      
-      // Generate actual alias from ID
-      const alias = generateAlias(id);
-      
-      // Update with generated alias
-      await client.query('UPDATE urls SET alias = $1 WHERE id = $2', [alias, id]);
+      await client.query(insertQuery, [id.toString(), alias, originalUrl, ownerId]);
 
       await client.query('COMMIT');
 
       // Warm cache
-      await redis.set(`url:${alias}`, originalUrl, this.CACHE_TTL);
+      // Warm cache with the full record for consistency with resolveUrl
+      const record: UrlRecord = {
+        id,
+        alias,
+        original_url: originalUrl,
+        owner_id: ownerId,
+        created_at: new Date() // Approximate for cache warming
+      };
+      await redis.set(`url:${alias}`, JSON.stringify(record, (key, value) => 
+        typeof value === 'bigint' ? value.toString() : value
+      ), this.CACHE_TTL);
       
       logger.info({ alias, originalUrl }, 'URL shortened successfully');
       return alias;
@@ -71,43 +81,65 @@ class UrlService {
   }
 
   /**
-   * Resolves an alias to the original URL using a read-through cache strategy.
+   * Resolves an alias to the original URL record using a read-through cache strategy.
+   * Returns the mapped UrlRecord or null if not found.
    */
-  async resolveUrl(alias: string): Promise<string | null> {
+  async resolveUrl(alias: string): Promise<UrlRecord | null> {
     try {
       // 1. Try Redis cache
-      const cachedUrl = await redis.get(`url:${alias}`);
-      if (cachedUrl) {
-        return cachedUrl;
+      const cachedData = await redis.get(`url:${alias}`);
+      if (cachedData) {
+        try {
+          const parsed = JSON.parse(cachedData);
+          return {
+            ...parsed,
+            id: BigInt(parsed.id),
+            created_at: new Date(parsed.created_at)
+          } as UrlRecord;
+        } catch (e) {
+          // If cache is poisoned with a raw string, treat as miss and refresh
+          logger.warn({ alias }, 'Cache data corrupted, falling back to DB');
+        }
       }
+    } catch (error) {
+      // Fail-open: If Redis is down, log the error but proceed to DB query
+      logger.error({ error, alias }, 'Redis lookup failed, falling back to database');
+    }
 
-      // 2. Cache miss, query PostgreSQL
-      const query = 'SELECT original_url FROM urls WHERE alias = $1 LIMIT 1';
+    try {
+      // 2. Cache miss or Redis failure, query PostgreSQL
+      const query = 'SELECT id, alias, original_url, owner_id, created_at FROM urls WHERE alias = $1 LIMIT 1';
       const result = await this.pool.query(query, [alias]);
 
       if (result.rows.length === 0) {
         return null;
       }
 
-      const originalUrl = result.rows[0].original_url;
+      const record: UrlRecord = {
+        id: BigInt(result.rows[0].id),
+        alias: result.rows[0].alias,
+        original_url: result.rows[0].original_url,
+        owner_id: result.rows[0].owner_id,
+        created_at: result.rows[0].created_at,
+      };
 
-      // 3. Populate Redis
-      await redis.set(`url:${alias}`, originalUrl, this.CACHE_TTL);
+      // 3. Populate Redis (non-blocking, don't throw if this fails)
+      try {
+        await redis.set(`url:${alias}`, JSON.stringify(record, (key, value) => 
+          typeof value === 'bigint' ? value.toString() : value
+        ), this.CACHE_TTL);
+      } catch (redisErr) {
+        logger.warn({ redisErr }, 'Failed to update Redis cache');
+      }
 
-      return originalUrl;
+      return record;
     } catch (error) {
       logger.error({ error, alias }, 'Error during URL resolution');
       throw new Error('Internal server error during resolution');
     }
   }
+
 }
 
-// In a real production app, the pool would be injected from a shared connection module
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
+export const urlService = new UrlService(sharedPool);
 
-export const urlService = new UrlService(pool);

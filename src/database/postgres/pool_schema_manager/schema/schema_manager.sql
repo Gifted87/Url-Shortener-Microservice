@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS clicks (
 -- These are examples; production systems should have a background worker or cron job to 
 -- automate partition creation.
 
+CREATE TABLE IF NOT EXISTS clicks_y2026m04 PARTITION OF clicks
+    FOR VALUES FROM ('2026-04-01 00:00:00+00') TO ('2026-05-01 00:00:00+00');
+
 CREATE TABLE IF NOT EXISTS clicks_y2026m05 PARTITION OF clicks
     FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00');
 

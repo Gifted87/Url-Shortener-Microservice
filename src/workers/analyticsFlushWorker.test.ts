@@ -33,7 +33,7 @@ describe('AnalyticsFlushWorker', () => {
                 lpop: jest.fn(),
                 exec: jest.fn().mockResolvedValue([
                     [null, JSON.stringify({
-                        url_id: 1,
+                        url_id: '1',
                         timestamp: '2023-01-01',
                         ip_address: '127.0.0.1',
                         user_agent: 'agent',
@@ -51,6 +51,10 @@ describe('AnalyticsFlushWorker', () => {
         worker = new AnalyticsFlushWorker(pgPool, redis);
     });
 
+    afterEach(async () => {
+        await worker.stop();
+    });
+
     it('should start and clear intervals', async () => {
         jest.useFakeTimers();
         jest.spyOn(global, 'setInterval');
@@ -64,24 +68,31 @@ describe('AnalyticsFlushWorker', () => {
         jest.useRealTimers();
     });
 
-    it('should flush events from redis to postgres', async () => {
+    it('should flush events from redis to postgres using bulk insert', async () => {
         await (worker as any).flush();
 
         expect(mClient.query).toHaveBeenCalledWith('BEGIN');
         expect(mClient.query).toHaveBeenCalledWith(
             expect.stringContaining('INSERT INTO clicks'),
-            [1, '2023-01-01', '127.0.0.1', 'agent', 'ref']
+            ['1', '2023-01-01', '127.0.0.1', 'agent', 'ref']
         );
         expect(mClient.query).toHaveBeenCalledWith('COMMIT');
         expect(mClient.release).toHaveBeenCalled();
     });
 
-    it('should discard malformed events', async () => {
+    it('should discard malformed events and NOT block the batch', async () => {
         (redis.pipeline as jest.Mock).mockReturnValueOnce({
             lpop: jest.fn(),
             exec: jest.fn().mockResolvedValue([
                 [null, JSON.stringify({
                     url_id: 'not-a-number', // invalid
+                    timestamp: '2023-01-01',
+                    ip_address: '127.0.0.1',
+                    user_agent: 'agent',
+                    referer: 'ref'
+                })],
+                [null, JSON.stringify({
+                    url_id: '2',
                     timestamp: '2023-01-01',
                     ip_address: '127.0.0.1',
                     user_agent: 'agent',
@@ -93,19 +104,42 @@ describe('AnalyticsFlushWorker', () => {
         await (worker as any).flush();
 
         expect(mClient.query).toHaveBeenCalledWith('BEGIN');
-        expect(mClient.query).not.toHaveBeenCalledWith(expect.stringContaining('INSERT INTO clicks'), expect.any(Array));
+        // Should only insert the valid one
+        expect(mClient.query).toHaveBeenCalledWith(
+            expect.stringContaining('INSERT INTO clicks'),
+            ['2', '2023-01-01', '127.0.0.1', 'agent', 'ref']
+        );
         expect(mClient.query).toHaveBeenCalledWith('COMMIT');
     });
 
-    it('should rollback transaction and requeue events if DB fails', async () => {
+    it('should discard batch on persistent DB error to prevent poison pill loop', async () => {
         mClient.query.mockImplementation(async (queryText) => {
             if (typeof queryText === 'string' && queryText.startsWith('INSERT')) {
-                throw new Error('DB error');
+                const err: any = new Error('FK violation');
+                err.code = '23503'; // Not transient
+                throw err;
+            }
+        });
+
+        await (worker as any).flush();
+
+        expect(mClient.query).toHaveBeenCalledWith('BEGIN');
+        expect(mClient.query).toHaveBeenCalledWith('ROLLBACK');
+        expect(redis.rpush).not.toHaveBeenCalled(); // Discarded
+        expect(mClient.release).toHaveBeenCalled();
+    });
+
+    it('should rollback transaction and requeue events on transient DB failure', async () => {
+        mClient.query.mockImplementation(async (queryText) => {
+            if (typeof queryText === 'string' && queryText.startsWith('INSERT')) {
+                const err: any = new Error('Connection lost');
+                err.code = '08006'; // Transient
+                throw err;
             }
         });
 
         const rawEvent = JSON.stringify({
-            url_id: 1,
+            url_id: '1',
             timestamp: '2023-01-01',
             ip_address: '127.0.0.1',
             user_agent: 'agent',
@@ -119,7 +153,6 @@ describe('AnalyticsFlushWorker', () => {
             ])
         });
 
-        // persistBatch will throw, caught by flush()
         await (worker as any).flush();
 
         expect(mClient.query).toHaveBeenCalledWith('BEGIN');

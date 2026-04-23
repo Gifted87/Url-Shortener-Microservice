@@ -72,8 +72,9 @@ describe('ClusterManager', () => {
     it('should exit when fork bomb detected', () => {
         const manager = new ClusterManager({ WORKER_COUNT: 1 } as any);
         
-        // Force the forkHistory to simulate a bomb (5 forks)
+        // Force the forkHistory to simulate a bomb (workerCount + 5 = 6 forks)
         (manager as any).forkHistory = [
+            Date.now(),
             Date.now(),
             Date.now(),
             Date.now(),

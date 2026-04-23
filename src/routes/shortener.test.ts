@@ -2,6 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import shortenerRouter from './shortener';
 import { urlService } from '../services/url/urlService';
+import { analyticsService } from '../services/analytics/analyticsService';
 import { validateShortenRequest } from '../validation/urlValidation';
 import { rateLimiter } from '../middleware/rate_limiter';
 
@@ -9,6 +10,12 @@ jest.mock('../services/url/urlService', () => ({
     urlService: {
         shortenUrl: jest.fn(),
         resolveUrl: jest.fn()
+    }
+}));
+
+jest.mock('../services/analytics/analyticsService', () => ({
+    analyticsService: {
+        trackClick: jest.fn().mockResolvedValue(undefined)
     }
 }));
 
@@ -20,11 +27,22 @@ jest.mock('../middleware/rate_limiter', () => ({
     rateLimiter: jest.fn((req, res, next) => next())
 }));
 
+jest.mock('../config/env', () => ({
+    config: {
+        PORT: 3000,
+        LOG_LEVEL: 'info',
+        DATABASE_URL: 'postgres://localhost:5432/test',
+        REDIS_URL: 'redis://localhost:6379/0',
+        BASE_URL: 'http://localhost:3000'
+    }
+}));
+
 jest.mock('pino', () => {
     return () => ({
         info: jest.fn(),
         warn: jest.fn(),
-        error: jest.fn()
+        error: jest.fn(),
+        debug: jest.fn()
     });
 });
 
@@ -59,8 +77,6 @@ describe('Shortener Routes', () => {
                 .post('/shorten')
                 .send({ original_url: 'https://example.com' });
 
-            // Next is called with error, express default error handler returns 500 html if not configured,
-            // so we expect a 500 status.
             expect(res.status).toBe(500);
         });
     });
@@ -78,7 +94,8 @@ describe('Shortener Routes', () => {
         });
 
         it('should redirect to original url if alias found', async () => {
-            (urlService.resolveUrl as jest.Mock).mockResolvedValue('https://target.com');
+            const mockRecord = { id: 123n, original_url: 'https://target.com' };
+            (urlService.resolveUrl as jest.Mock).mockResolvedValue(mockRecord);
 
             const res = await request(app)
                 .get('/exists');
@@ -86,6 +103,7 @@ describe('Shortener Routes', () => {
             expect(res.status).toBe(302);
             expect(res.header.location).toBe('https://target.com');
             expect(urlService.resolveUrl).toHaveBeenCalledWith('exists');
+            expect(analyticsService.trackClick).toHaveBeenCalled();
         });
 
         it('should handle service errors during resolution', async () => {
@@ -98,3 +116,4 @@ describe('Shortener Routes', () => {
         });
     });
 });
+

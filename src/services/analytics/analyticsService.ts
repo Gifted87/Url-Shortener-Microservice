@@ -1,5 +1,6 @@
 import { redis } from '../../database/redis/redisClient';
 import { Pool } from 'pg';
+import { pool as sharedPool } from '../../database/postgres/pool';
 import pino from 'pino';
 import { isIP } from 'net';
 
@@ -9,7 +10,7 @@ const logger = pino({ level: 'info' });
  * Interface for click metadata passed to the analytics service.
  */
 export interface ClickEvent {
-    url_id: number;
+    url_id: string;
     ip_address: string;
     user_agent: string;
     referer: string;
@@ -18,17 +19,13 @@ export interface ClickEvent {
 /**
  * AnalyticsService provides non-blocking event ingestion and buffered persistence.
  */
-class AnalyticsService {
+export class AnalyticsService {
     private readonly BUFFER_KEY = 'analytics:buffer';
     private readonly MAX_BUFFER_SIZE = 10000;
     private readonly pgPool: Pool;
 
-    constructor() {
-        this.pgPool = new Pool({
-            connectionString: process.env.DATABASE_URL,
-            max: 20,
-            idleTimeoutMillis: 30000,
-        });
+    constructor(pool: Pool) {
+        this.pgPool = pool;
     }
 
     /**
@@ -42,7 +39,7 @@ class AnalyticsService {
     /**
      * Captures request metadata and offloads to Redis for real-time aggregation and batching.
      */
-    async trackClick(urlId: number, ip: string, userAgent: string, referer: string): Promise<void> {
+    async trackClick(urlId: string, ip: string, userAgent: string, referer: string): Promise<void> {
         if (!isIP(ip)) {
             logger.warn({ ip }, 'Invalid IP address received');
             return;
@@ -86,33 +83,56 @@ class AnalyticsService {
      * Processes buffered clicks and flushes to PostgreSQL.
      * Intended to be called by a background worker process.
      */
+    /**
+     * Processes buffered clicks and flushes to PostgreSQL using high-throughput bulk insertion.
+     */
     async processBufferedClicks(batchSize: number = 100): Promise<void> {
+        const rawEvents: string[] = [];
+        const parsedEvents: (ClickEvent & { timestamp: string })[] = [];
+
+        for (let i = 0; i < batchSize; i++) {
+            const raw = await redis.lpop(this.BUFFER_KEY);
+            if (typeof raw !== 'string' || raw.length === 0) break;
+            
+            try {
+                const parsed = JSON.parse(raw) as ClickEvent & { timestamp: string };
+                rawEvents.push(raw);
+                parsedEvents.push(parsed);
+            } catch (e) {
+                logger.error({ e, raw }, 'Discarding unparseable analytics event');
+            }
+        }
+
+        if (parsedEvents.length === 0) return;
+
         const client = await this.pgPool.connect();
         try {
-            for (let i = 0; i < batchSize; i++) {
-                const rawEvent = await redis.lpop(this.BUFFER_KEY);
-                if (!rawEvent) break;
+            const paramCount = 5;
+            const placeholders = parsedEvents.map((_, i) => 
+                `($${i * paramCount + 1}, $${i * paramCount + 2}, $${i * paramCount + 3}, $${i * paramCount + 4}, $${i * paramCount + 5})`
+            ).join(',');
 
-                const event = JSON.parse(rawEvent) as ClickEvent & { timestamp: string };
+            const flatParams = parsedEvents.flatMap(e => [
+                e.url_id,
+                e.timestamp,
+                e.ip_address,
+                this.sanitize(e.user_agent),
+                this.sanitize(e.referer)
+            ]);
 
-                try {
-                    await client.query(
-                        `INSERT INTO clicks (url_id, timestamp, ip_address, user_agent, referer) 
-                         VALUES ($1, $2, $3, $4, $5)`,
-                        [event.url_id, event.timestamp, event.ip_address, event.user_agent, event.referer]
-                    );
-                } catch (dbErr) {
-                    logger.error({ dbErr, event }, 'Database flush failed, re-queueing');
-                    await redis.rpush(this.BUFFER_KEY, rawEvent);
-                    throw dbErr;
-                }
-            }
+            const query = `INSERT INTO clicks (url_id, timestamp, ip_address, user_agent, referer) VALUES ${placeholders}`;
+            await client.query(query, flatParams);
         } catch (err) {
-            logger.error({ err }, 'Error during background processing cycle');
+            logger.error({ err }, 'Bulk insert failed. Re-queueing batch.');
+            for (const raw of rawEvents) {
+                await redis.rpush(this.BUFFER_KEY, raw);
+            }
+            throw err;
         } finally {
             client.release();
         }
     }
 }
 
-export const analyticsService = new AnalyticsService();
+export const analyticsService = new AnalyticsService(sharedPool);
+

@@ -36,23 +36,31 @@ function sanitizeValue(value: any): any {
 }
 
 /**
- * Recursively sanitizes objects (req.body, req.query).
+ * Recursively sanitizes objects (req.body, req.query) with a depth limit to prevent DoS.
  */
-function sanitizeInput(input: any): any {
+function sanitizeInput(input: any, depth: number = 0): any {
+  // Prevent stack overflow and CPU exhaustion from deeply nested objects
+  const MAX_DEPTH = 10;
+  if (depth > MAX_DEPTH) {
+    throw new Error('Maximum recursion depth exceeded during sanitization');
+  }
+
+
   if (input === null || typeof input !== 'object') {
     return sanitizeValue(input);
   }
 
   if (Array.isArray(input)) {
-    return input.map((item) => sanitizeInput(item));
+    return input.map((item) => sanitizeInput(item, depth + 1));
   }
 
   const sanitizedObject: Record<string, any> = {};
   for (const [key, value] of Object.entries(input)) {
-    sanitizedObject[key] = sanitizeInput(value);
+    sanitizedObject[key] = sanitizeInput(value, depth + 1);
   }
   return sanitizedObject;
 }
+
 
 /**
  * Middleware: Enforces secure HTTP headers using Helmet.
@@ -88,6 +96,9 @@ export const requestSanitizationMiddleware = (req: Request, res: Response, next:
     }
     if (req.query) {
       req.query = sanitizeInput(req.query);
+    }
+    if (req.params) {
+      req.params = sanitizeInput(req.params);
     }
     next();
   } catch (error) {

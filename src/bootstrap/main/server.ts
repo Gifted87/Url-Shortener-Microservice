@@ -4,6 +4,11 @@ import pino from 'pino';
 import { config } from '../../config/env';
 import { helmetMiddleware, requestSanitizationMiddleware } from '../../middleware/security/securityMiddleware';
 import { rateLimiter } from '../../middleware/rate_limiter';
+import v1Router from '../../routes/shortener';
+import { HealthController } from '../health/health';
+import { ShutdownManager } from '../lifecycle/shutdown';
+import { pool } from '../../database/postgres/pool';
+import { redis } from '../../database/redis/redisClient';
 
 /**
  * @file server.ts
@@ -25,6 +30,9 @@ const logger = pino({
  */
 export function createServer(): Express {
   const app = express();
+  
+  // 0. Networking Infrastructure
+  app.set('trust proxy', config.PROXY_TRUST_DEPTH);
 
   try {
     // 1. Security Infrastructure
@@ -38,12 +46,11 @@ export function createServer(): Express {
     // 3. Distributed Rate Limiting
     app.use(rateLimiter);
 
-    // Placeholder for router integration
-    // app.use('/api', v1Router);
+    // Mount API Routes
+    app.use('/api', v1Router);
     
-    app.get('/health', (req, res) => {
-      res.status(200).json({ status: 'UP', timestamp: new Date().toISOString() });
-    });
+    // 4. Infrastructure Health Probes
+    app.use(HealthController.createRouter(pool, redis));
 
   } catch (error) {
     logger.fatal({ error }, 'Failed to initialize Express application components');
@@ -85,22 +92,17 @@ export async function startServer() {
   }
 
   // Graceful Shutdown Logic
-  const shutdown = (signal: string) => {
-    logger.info({ signal }, 'Shutdown signal received. Initiating graceful shutdown.');
-    server.close(() => {
-      logger.info('HTTP server closed. Exiting process.');
-      process.exit(0);
-    });
+  const shutdownManager = new ShutdownManager(server, pool);
+  shutdownManager.initialize();
 
-    // Force shutdown after timeout
-    setTimeout(() => {
-      logger.error('Graceful shutdown timeout exceeded. Forcing exit.');
-      process.exit(1);
-    }, 10000);
-  };
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  // Listen for IPC messages from Cluster Manager (K8s friendly shutdown)
+  process.on('message', (msg) => {
+    if (msg && typeof msg === 'object' && (msg as any).type === 'SHUTDOWN') {
+      logger.info('IPC Shutdown signal received from cluster manager');
+      // shutdownManager handles signals, but we can trigger it manually for IPC
+      process.emit('SIGTERM');
+    }
+  });
 }
 
 if (require.main === module) {
@@ -109,3 +111,4 @@ if (require.main === module) {
     process.exit(1);
   });
 }
+

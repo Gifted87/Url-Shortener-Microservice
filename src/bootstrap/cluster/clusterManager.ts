@@ -17,14 +17,41 @@ export class ClusterManager {
   private readonly config: AppConfig;
   private readonly workerCount: number;
   private readonly forkHistory: number[] = [];
-  private readonly FORK_THRESHOLD = 5;
+  private FORK_THRESHOLD: number = 5;
   private readonly FORK_WINDOW_MS = 60000;
+  private readonly analyticsWorker?: any;
   private isShuttingDown = false;
 
-  constructor(config: AppConfig) {
+  constructor(config: AppConfig, analyticsWorker?: any) {
     this.config = config;
-    this.workerCount = config.WORKER_COUNT || os.cpus().length;
+    this.analyticsWorker = analyticsWorker;
+    
+    // Safety check for containerized environments:
+    // 1. Prioritize explicit environment variable
+    // 2. Use availableParallelism() if available (Node 19.4+)
+    // 3. Default to 1 to prevent OOM in restricted containers
+    let cores = 1;
+    try {
+      if (typeof os.availableParallelism === 'function') {
+        cores = os.availableParallelism();
+      } else {
+        cores = os.cpus().length;
+      }
+    } catch (e) {
+      cores = 1;
+    }
+    
+    this.workerCount = config.WORKER_COUNT || cores;
+    
+    // Limit to a reasonable maximum for Node clustering in containers if not specified
+    if (!config.WORKER_COUNT && this.workerCount > 4) {
+      this.workerCount = 4;
+    }
+    
+    // Dynamically adjust threshold to allow initial burst
+    this.FORK_THRESHOLD = this.workerCount + 5;
   }
+
 
   /**
    * Orchestrates the spawning of worker processes.
@@ -86,6 +113,16 @@ export class ClusterManager {
     const message: WorkerLifecycleEvent = { type: 'SHUTDOWN' };
     for (const id in cluster.workers) {
       cluster.workers[id]?.send(message);
+    }
+
+    // Stop analytics worker if running on primary
+    if (this.analyticsWorker) {
+      try {
+        await this.analyticsWorker.stop();
+        logger.info('Analytics worker stopped successfully on primary');
+      } catch (err) {
+        logger.error({ err }, 'Error stopping analytics worker on primary');
+      }
     }
 
     // Wait for the configured timeout to allow workers to exit cleanly

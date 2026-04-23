@@ -5,7 +5,8 @@ import { redis } from '../../database/redis/redisClient';
 jest.mock('../../database/redis/redisClient', () => ({
     redis: {
         pipeline: jest.fn(),
-        set: jest.fn()
+        set: jest.fn(),
+        expire: jest.fn()
     }
 }));
 
@@ -13,7 +14,8 @@ jest.mock('pino', () => {
     return () => ({
         info: jest.fn(),
         warn: jest.fn(),
-        error: jest.fn()
+        error: jest.fn(),
+        debug: jest.fn()
     });
 });
 
@@ -41,6 +43,7 @@ describe('rateLimiter middleware', () => {
     it('should allow request and set headers if under limit', async () => {
         (redis.pipeline as jest.Mock).mockResolvedValue([
             [null, 5],
+            [null, 1], // expire NX result
             [null, 30] // ttl
         ]);
 
@@ -48,10 +51,11 @@ describe('rateLimiter middleware', () => {
 
         expect(redis.pipeline).toHaveBeenCalledWith([
             ['incr', 'ratelimit:127.0.0.1'],
+            ['expire', 'ratelimit:127.0.0.1', 60, 'NX'],
             ['ttl', 'ratelimit:127.0.0.1']
         ]);
         
-        expect(redis.set).not.toHaveBeenCalled(); // since count !== 1
+        expect(redis.expire).not.toHaveBeenCalled(); // since ttl is not -1
         expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', expect.any(String));
         expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Remaining', expect.any(String));
         expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Reset', expect.any(String));
@@ -63,7 +67,8 @@ describe('rateLimiter middleware', () => {
     it('should block request if over limit', async () => {
         (redis.pipeline as jest.Mock).mockResolvedValue([
             [null, 150], // max is 100
-            [null, 10]
+            [null, 0], // expire NX result (key already exists)
+            [null, 10] // ttl
         ]);
 
         await rateLimiter(req as Request, res as Response, next);
@@ -77,15 +82,16 @@ describe('rateLimiter middleware', () => {
         expect(next).not.toHaveBeenCalled();
     });
 
-    it('should set expiration if first request', async () => {
+    it('should set expiration as fallback if TTL is still -1', async () => {
         (redis.pipeline as jest.Mock).mockResolvedValue([
             [null, 1], // first request
-            [null, -1] // no ttl yet
+            [null, 0], // expire NX failed for some reason
+            [null, -1] // still no ttl
         ]);
 
         await rateLimiter(req as Request, res as Response, next);
 
-        expect(redis.set).toHaveBeenCalledWith('ratelimit:127.0.0.1', '1', expect.any(Number));
+        expect(redis.expire).toHaveBeenCalledWith('ratelimit:127.0.0.1', expect.any(Number));
         expect(next).toHaveBeenCalled();
     });
 
@@ -101,6 +107,7 @@ describe('rateLimiter middleware', () => {
     it('should fail-open if incr returns error', async () => {
         (redis.pipeline as jest.Mock).mockResolvedValue([
             [new Error('Incr error'), null],
+            [null, null],
             [null, null]
         ]);
 
@@ -110,3 +117,4 @@ describe('rateLimiter middleware', () => {
         expect(res.status).not.toHaveBeenCalled();
     });
 });
+

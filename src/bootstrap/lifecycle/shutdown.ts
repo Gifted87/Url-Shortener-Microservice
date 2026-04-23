@@ -35,10 +35,7 @@ export class ShutdownManager {
             // 1. Stop accepting new connections
             await this.drainServer();
 
-            // 2. Flush Analytics Telemetry
-            await this.flushAnalytics();
-
-            // 3. Decommission Resource Pools
+            // 2. Decommission Resource Pools
             await this.closeResources();
 
             logger.info('Graceful shutdown completed successfully.');
@@ -70,22 +67,7 @@ export class ShutdownManager {
         });
     }
 
-    private async flushAnalytics(): Promise<void> {
-        logger.info('Initiating analytics flush...');
-        try {
-            await analyticsService.processBufferedClicks(500);
-            logger.info('Analytics flush completed.');
-        } catch (err) {
-            logger.error({ err }, 'Initial analytics flush failed. Retrying...');
-            try {
-                await analyticsService.processBufferedClicks(500);
-                logger.info('Retry analytics flush successful.');
-            } catch (retryErr) {
-                logger.error({ retryErr }, 'Final analytics flush retry failed. Data may be lost.');
-                // Proceed despite failure to ensure process termination
-            }
-        }
-    }
+
 
     private async closeResources(): Promise<void> {
         logger.info('Closing database and cache pools...');

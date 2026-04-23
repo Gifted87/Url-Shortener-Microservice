@@ -18,6 +18,8 @@ export interface AppConfig {
   LOG_LEVEL: 'debug' | 'info' | 'warn' | 'error';
   WORKER_COUNT?: number;
   SHUTDOWN_TIMEOUT_MS: number;
+  BASE_URL: string;
+  PROXY_TRUST_DEPTH: number;
 }
 
 /**
@@ -45,6 +47,12 @@ const schema = Joi.object<AppConfig>({
   SHUTDOWN_TIMEOUT_MS: Joi.number()
     .min(0)
     .default(10000),
+  BASE_URL: Joi.string()
+    .uri()
+    .default('http://localhost:3000'),
+  PROXY_TRUST_DEPTH: Joi.number()
+    .min(1)
+    .default(1),
 });
 
 /**
