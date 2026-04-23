@@ -112,8 +112,8 @@ The UrlService orchestrates the core business logic of generating short URLs and
 **The Write Path: Transactional Integrity and Collision Resistance**
 When a client requests a new short URL, the system immediately initiates a PostgreSQL transaction (BEGIN, COMMIT, ROLLBACK). It inserts a placeholder record into the urls table to secure an auto-incremented BIGSERIAL ID. By mathematically mapping this database sequence ID to Base62, the system guarantees 100% collision resistance. The service then updates the placeholder with the generated alias and rapidly warms the Redis cache (CACHE_TTL = 86400s) to ensure immediate read availability. This two-phase insertion eliminates the check-then-insert loops that historically plague random-string generators, providing robust scalability even under extreme load.
 
-**The Read Path: Read-Through Cache Strategy**
-URL resolution implements a read-through caching strategy. The service queries the Redis cluster first (url:{alias}). On a cache hit, the original URL is retrieved and returned in mere milliseconds, entirely bypassing the database. If a cache miss occurs, the service queries the original_url from PostgreSQL, immediately populates the Redis cache, and returns the result to the caller. This significantly minimizes database I/O for frequently accessed, viral links, ensuring the microservice remains highly responsive.
+**The Read Path: Fail-Open Read-Through Cache Strategy**
+URL resolution implements a read-through caching strategy with a fail-open fallback. The service queries the Redis cluster first (`url:{alias}`). On a cache hit, the original URL is retrieved in mere milliseconds, entirely bypassing the database. If a cache miss occurs, the service queries PostgreSQL, immediately re-populates the Redis cache, and returns the result. Critically, if Redis is **unavailable** (network partition, crash), the service catches the error, logs a structured warning, and falls back directly to PostgreSQL rather than returning a 500 error. This fail-open design ensures URL resolution continues uninterrupted even when the cache layer is degraded.
 
 #### Asynchronous Analytics Pipeline (src/services/analytics/analyticsService.ts)
 Tracking every click synchronously during a redirect is an anti-pattern that severely degrades the user experience. The AnalyticsService operates asynchronously, prioritizing low-latency redirection over real-time database persistence. 
@@ -126,11 +126,11 @@ Furthermore, the service employs a backpressure mechanism. If the Redis buffer s
 To complement the asynchronous services, background workers handle the heavy lifting out-of-band. The primary component here is the AnalyticsFlushWorker (src/workers/analyticsFlushWorker.ts).
 
 #### The Analytics Flush Daemon
-Operating on a fixed interval (setInterval), this daemon awakens to process telemetry data queued in Redis. Instead of executing hundreds of individual database insertions, it uses a Redis pipeline to atomically pop a massive batch of events.
+Operating on a fixed interval (`setInterval`), this daemon awakens to process telemetry data queued in Redis. It atomically pops a configurable batch of raw JSON events using `LPOP` and immediately begins parallel parsing. Critically, malformed events ("poison pills" with invalid JSON or missing required fields) are **discarded** rather than re-queued — preventing a single corrupt record from permanently blocking the flush pipeline.
 
-The worker parses the raw JSON payloads, strictly validates each event, and discards malformed data. It then opens a PostgreSQL transaction and executes a massive INSERT statement to persist the batch of clicks into the database. If a deadlock or connection timeout occurs, the transaction rolls back, and the events are rapidly re-queued into the Redis list (RPUSH), providing at-least-once delivery semantics and eventual consistency.
+Once a valid batch is assembled, the worker constructs a single high-throughput **multi-row `INSERT`** statement with parameterised placeholders (`$1, $2, ... $N`) and executes it in one round-trip to PostgreSQL. This approach is vastly more efficient than wrapping hundreds of individual inserts in a `BEGIN`/`COMMIT` transaction block. If a transient database error occurs, only **transient** failures trigger re-queuing into the Redis list (`RPUSH`), providing at-least-once delivery semantics while avoiding infinite retry loops on malformed data.
 
-This batching strategy significantly reduces transaction overhead and network latency between the application and the database.
+This batching strategy reduces transaction overhead, network round-trips, and lock contention — enabling the system to sustain high analytics throughput even under heavy concurrent write load.
 
 ### 4.7. Core Utilities and Boundary Validation (src/utils, src/validation)
 Data integrity must be protected both mathematically and systematically. These modules ensure data flows securely and accurately.
@@ -180,50 +180,60 @@ In a clustered or multi-server environment, maintaining an accurate count of req
 // src/middleware/rate_limiter/index.ts
 const results = await redis.pipeline([
     ['incr', key],
-    ['ttl', key]
+    ['expire', key, RATE_LIMIT_WINDOW_SECONDS, 'NX']
 ]);
 
-const [[errIncr, count], [errTtl, ttl]] = results;
-
-if (currentCount === 1) {
-    // Only set the expiration on the very first request of the window
-    await redis.set(key, '1', RATE_LIMIT_WINDOW_SECONDS);
-}
+const [[errIncr, count], [errExpire]] = results;
 ```
-**Why this matters:** The pipeline ensures that the INCR operation happens atomically on the Redis server. Node.js never reads the value into memory to increment it; Redis does the math. This guarantees absolute accuracy even under massive concurrent load.
+**Why this matters:** The `EXPIRE … NX` flag sets the TTL **only if the key has no existing expiry**, ensuring the window starts on the first request and is never accidentally reset mid-window by a subsequent call. Combining `INCR` and `EXPIRE NX` in a single atomic pipeline eliminates the race condition that exists when expiry is set in a separate round-trip — guaranteeing accurate quota enforcement even at high concurrency across multiple Node.js worker processes.
 
 ### 5.3. Asynchronous Batch Processing
 Writing analytics to PostgreSQL on every single HTTP request would cripple the database. Instead, the AnalyticsFlushWorker pops events from Redis and inserts them in bulk.
 
 ```typescript
-// src/workers/analyticsFlushWorker.ts
-private async persistBatch(rawEvents: string[]): Promise<void> {
+// src/services/analytics/analyticsService.ts (simplified)
+async processBufferedClicks(batchSize: number = 100): Promise<void> {
+    const rawEvents: string[] = [];
+    const parsedEvents: ClickEvent[] = [];
+
+    for (let i = 0; i < batchSize; i++) {
+        const raw = await redis.lpop(this.BUFFER_KEY);
+        if (!raw) break;
+        try {
+            parsedEvents.push(JSON.parse(raw));
+            rawEvents.push(raw);
+        } catch {
+            // Discard poison-pill records — invalid JSON cannot be recovered
+            logger.error({ raw }, 'Discarding unparseable analytics event');
+        }
+    }
+
+    if (parsedEvents.length === 0) return;
+
+    const placeholders = parsedEvents.map((_, i) =>
+        `($${i*5+1},$${i*5+2},$${i*5+3},$${i*5+4},$${i*5+5})`
+    ).join(',');
+    const flatParams = parsedEvents.flatMap(e => [
+        e.url_id, e.timestamp, e.ip_address, e.user_agent, e.referer
+    ]);
+
     const client = await this.pgPool.connect();
     try {
-        await client.query('BEGIN');
-        
-        for (const raw of rawEvents) {
-            const event = JSON.parse(raw);
-            await client.query(
-                `INSERT INTO clicks (url_id, timestamp, ip_address, user_agent, referer) 
-                 VALUES ($1, $2, $3, $4, $5)`,
-                [event.url_id, event.timestamp, event.ip_address, event.user_agent, event.referer]
-            );
-        }
-        
-        await client.query('COMMIT');
+        await client.query(
+            `INSERT INTO clicks (url_id, timestamp, ip_address, user_agent, referer)
+             VALUES ${placeholders}`,
+            flatParams
+        );
     } catch (err) {
-        await client.query('ROLLBACK');
-        // Re-queue the failed batch back into Redis to prevent data loss
-        for (const raw of rawEvents) {
-            await this.redis.rpush(this.bufferKey, raw);
-        }
+        // Re-queue batch on transient DB error; do NOT re-queue poison pills
+        for (const raw of rawEvents) await redis.rpush(this.BUFFER_KEY, raw);
+        throw err;
     } finally {
         client.release();
     }
 }
 ```
-**Why this matters:** By wrapping the entire batch of inserts in a BEGIN and COMMIT block, the database executes them highly efficiently. If any part of the batch fails (e.g., due to a temporary network blip or a malformed row), the ROLLBACK undoes the partial writes, and the worker pushes the raw strings back into Redis. This provides at-least-once delivery semantics, ensuring zero telemetry data is ever permanently lost.
+**Why this matters:** A single multi-row `INSERT` with N value tuples is processed in **one database round-trip**, dramatically reducing lock contention and network overhead compared to N individual `INSERT` statements inside a transaction. Poison-pill discarding prevents a single corrupt record from permanently blocking the flush pipeline.
 
 ## 6. API Route Documentation
 
@@ -279,13 +289,14 @@ Deploying this microservice requires careful orchestration of Node.js, PostgreSQ
 
 ### 7.1. Environmental Configuration
 The application relies strictly on environment variables. A missing variable will cause the application to fail to boot.
-- NODE_ENV: Must be set to production in live environments to enable Express caching and disable verbose error stacks.
-- PORT: The HTTP port the Express server will bind to (e.g., 3000).
-- DATABASE_URL: A fully qualified PostgreSQL connection string (e.g., postgres://user:pass@db-host:5432/shortener).
-- REDIS_URL: The connection string for the Redis cluster.
-- LOG_LEVEL: Configures Pino logging output (info, warn, error). In high-traffic environments, set this to warn to save disk I/O.
-- WORKER_COUNT: Overrides the default CPU-core detection. Set this explicitly in containerized environments where CPU quotas might not accurately reflect hardware cores.
-- SHUTDOWN_TIMEOUT_MS: The maximum time (in milliseconds) the application will wait for graceful drainage before forcefully exiting (e.g., 10000).
+- NODE_ENV: Must be set to `production` in live environments to enable Express caching and disable verbose error stacks.
+- PORT: The HTTP port the Express server will bind to (e.g., `3000`).
+- DATABASE_URL: A fully qualified PostgreSQL connection string (e.g., `postgres://user:pass@db-host:5432/shortener`).
+- REDIS_URL: The full connection string for the Redis instance (e.g., `redis://redis-host:6379`). Supports `REDIS_URL` convention used by most managed providers.
+- LOG_LEVEL: Configures Pino logging output (`info`, `warn`, `error`). In high-traffic environments, set this to `warn` to save disk I/O.
+- WORKER_COUNT: Overrides the default CPU-core detection. Set this explicitly in containerised environments where CPU quotas might not accurately reflect hardware cores.
+- SHUTDOWN_TIMEOUT_MS: The maximum time (in milliseconds) the application will wait for graceful drainage before forcefully exiting (e.g., `10000`).
+- PROXY_TRUST_DEPTH: The number of trusted reverse-proxy hops to count when extracting the real client IP from `X-Forwarded-For` headers (e.g., `1` for a single load balancer). Required for accurate rate limiting behind an Ingress or CDN.
 
 ### 7.2. Database Schema and Migrations
 Before starting the application, the database schema must be initialized.
